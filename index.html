@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0b2239"><link rel="manifest" href="manifest.webmanifest">
+  <title>无源交流电流表读表器</title>
+  <style>
+    :root{font-family:system-ui,sans-serif;color:#10243a;background:#eef4f8}body{max-width:900px;margin:auto;padding:16px}
+    h1{font-size:1.45rem}.bar,.card{display:flex;gap:10px;flex-wrap:wrap;align-items:center;background:white;padding:14px;margin:10px 0;border-radius:12px;box-shadow:0 2px 12px #1232}
+    button,select{font:inherit;padding:9px 13px;border-radius:8px;border:1px solid #789;background:white}button{background:#1261a0;color:white;border:0}
+    .meter{font-size:2.2rem;font-weight:700}.ok{color:#19723a}.low,.high,.offline,.error{color:#b42318}table{width:100%;border-collapse:collapse;background:white}th,td{padding:7px;border-bottom:1px solid #dce5ec;text-align:left}canvas{width:100%;height:220px;background:white;border-radius:12px}.small{font-size:.85rem;color:#536779}
+  </style>
+</head>
+<body>
+  <h1>“无源”交流电流表手机读表器</h1>
+  <div class="bar">
+    <select id="mode"><option value="basic">基本模式（指定地址）</option><option value="auto">自动模式（全部地址）</option></select>
+    <select id="address"></select><button id="scan">开始扫描</button><button id="stop">停止</button><button id="csv">导出 CSV</button><button id="clear">清空记录</button>
+  </div>
+  <div class="card"><div><div class="small">当前电流</div><div id="current" class="meter">-- A</div></div><div><b id="state" class="offline">未连接</b><div id="detail" class="small">等待 HC-08 广播</div></div></div>
+  <canvas id="trend" width="850" height="220"></canvas>
+  <h2>历史记录（掉电保存在手机中）</h2>
+  <table><thead><tr><th>时间</th><th>地址</th><th>电流/A</th><th>状态</th></tr></thead><tbody id="rows"></tbody></table>
+  <p class="small">自动模式持续扫描，实时更新全部表；每个地址至少每 2 分钟保存一条记录。离线超过 10 秒显示离线报警。要求 Android Chrome 且页面使用 HTTPS/localhost。</p>
+  <script src="app.js"></script>
+</body></html>
