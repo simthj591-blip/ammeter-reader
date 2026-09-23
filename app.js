@@ -1,20 +1,380 @@
 'use strict';
-const $=id=>document.getElementById(id), KEY='passive-ammeter-records-v1';
-let scan=null, records=JSON.parse(localStorage.getItem(KEY)||'[]'), meters=new Map();
-for(let i=0;i<16;i++) $('address').add(new Option(i.toString(16).toUpperCase(),i.toString(16).toUpperCase()));
-function crc8(s){let c=0;for(const ch of s){c^=ch.charCodeAt(0);for(let b=0;b<8;b++)c=(c&128)?((c<<1)^7)&255:(c<<1)&255}return c}
-function parse(text){const m=text.match(/M1[0-9A-F][0-9]{4}[0-9A-F]{3}[0-9A-F]{2}/i);if(!m)return null;const f=m[0].toUpperCase();if(crc8(f.slice(0,10))!==parseInt(f.slice(10),16))return null;return{address:f[2],mA:+f.slice(3,7),flags:parseInt(f[7],16),seq:parseInt(f.slice(8,10),16)}}
-function bytesText(view){return new TextDecoder().decode(new Uint8Array(view.buffer,view.byteOffset,view.byteLength))}
-function eventFrames(e){const out=[];if(e.device?.name)out.push(e.device.name);for(const map of [e.manufacturerData,e.serviceData])if(map)for(const v of map.values())out.push(bytesText(v));return out}
-function statusOf(m,offline=false){if(offline)return'OFFLINE';if(m.flags&4)return'ERROR';if(m.flags&8)return'UNCAL';if(m.mA<200||m.flags&1)return'LOW';if(m.mA>2000||m.flags&2)return'HIGH';return'NORMAL'}
-function accept(m){if($('mode').value==='basic'&&m.address!==$('address').value)return;const now=Date.now(),old=meters.get(m.address);m.time=now;m.saved=old?.saved||0;if(!old||now-m.saved>=120000){m.saved=now;records.push({time:now,address:m.address,mA:m.mA,state:statusOf(m)});if(records.length>500)records=records.slice(-500);localStorage.setItem(KEY,JSON.stringify(records))}meters.set(m.address,m);render()}
-function onAdv(e){for(const text of eventFrames(e)){const m=parse(text);if(m){accept(m);break}}}
-async function start(){if(!navigator.bluetooth)throw Error('此浏览器不支持 Web Bluetooth');if(navigator.bluetooth.requestLEScan){scan=await navigator.bluetooth.requestLEScan({acceptAllAdvertisements:true,keepRepeatedDevices:true});navigator.bluetooth.addEventListener('advertisementreceived',onAdv)}else{const d=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[0xffe0]});d.addEventListener('advertisementreceived',onAdv);await d.watchAdvertisements();scan=d} $('scan').textContent='扫描中'}
-function stop(){if(scan?.stop)scan.stop();navigator.bluetooth?.removeEventListener('advertisementreceived',onAdv);scan=null;$('scan').textContent='开始扫描'}
-function render(){const wanted=$('mode').value==='basic'?meters.get($('address').value):[...meters.values()].sort((a,b)=>b.time-a.time)[0];if(wanted){const off=Date.now()-wanted.time>10000,s=statusOf(wanted,off);$('current').textContent=(wanted.mA/1000).toFixed(3)+' A';$('state').textContent=s;$('state').className=s==='NORMAL'?'ok':s.toLowerCase();$('detail').textContent=`地址 ${wanted.address}  V1  序号 ${wanted.seq}  ${new Date(wanted.time).toLocaleTimeString()}`}else{$('current').textContent='-- A';$('state').textContent='未发现';$('state').className='offline'}
-  $('rows').innerHTML=records.slice(-100).reverse().map(r=>`<tr><td>${new Date(r.time).toLocaleString()}</td><td>${r.address}</td><td>${(r.mA/1000).toFixed(3)}</td><td>${r.state}</td></tr>`).join('');draw()}
-function draw(){const c=$('trend'),x=c.getContext('2d'),a=$('address').value,p=records.filter(r=>r.address===a).slice(-60);x.clearRect(0,0,c.width,c.height);x.strokeStyle='#cad8e2';x.beginPath();for(let y=20;y<c.height;y+=40){x.moveTo(0,y);x.lineTo(c.width,y)}x.stroke();if(p.length<2)return;const max=Math.max(2100,...p.map(v=>v.mA));x.strokeStyle='#1261a0';x.lineWidth=3;x.beginPath();p.forEach((v,i)=>{const px=i*c.width/(p.length-1),py=c.height-10-v.mA*(c.height-20)/max;i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}
-$('scan').onclick=()=>start().catch(e=>alert(e.message));$('stop').onclick=stop;$('mode').onchange=render;$('address').onchange=render;
-$('clear').onclick=()=>{if(confirm('清空手机中的全部记录？')){records=[];localStorage.removeItem(KEY);render()}};
-$('csv').onclick=()=>{const s='time,address,current_A,status\n'+records.map(r=>`${new Date(r.time).toISOString()},${r.address},${(r.mA/1000).toFixed(3)},${r.state}`).join('\n'),a=document.createElement('a');a.href=URL.createObjectURL(new Blob([s],{type:'text/csv'}));a.download='ammeter.csv';a.click()};
-setInterval(render,1000);render();if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js');
+
+const $ = id => document.getElementById(id);
+const KEY = 'passive-ammeter-records-v1';
+const HC08_SERVICE_UUID = 0xffe0;
+const HC08_CHARACTERISTIC_UUID = 0xffe1;
+const AUTO_READ_PERIOD_MS = 120000;
+const AUTO_OFFLINE_MS = 130000;
+const RESPONSE_TIMEOUT_MS = 5000;
+
+let records = JSON.parse(localStorage.getItem(KEY) || '[]');
+const meters = new Map();
+const links = new Map();
+let autoTimer = null;
+
+for (let i = 0; i < 16; i++) {
+  const address = i.toString(16).toUpperCase();
+  $('address').add(new Option(address, address));
+}
+
+function crc8(text) {
+  let crc = 0;
+  for (const character of text) {
+    crc ^= character.charCodeAt(0);
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+    }
+  }
+  return crc;
+}
+
+function parse(text) {
+  const match = text.match(/M1[0-9A-F][0-9]{4}[0-9A-F]{3}[0-9A-F]{2}/i);
+  if (!match) return null;
+
+  const frame = match[0].toUpperCase();
+  if (crc8(frame.slice(0, 10)) !== parseInt(frame.slice(10), 16)) return null;
+
+  return {
+    address: frame[2],
+    mA: Number(frame.slice(3, 7)),
+    flags: parseInt(frame[7], 16),
+    seq: parseInt(frame.slice(8, 10), 16)
+  };
+}
+
+function bytesText(view) {
+  return new TextDecoder().decode(
+    new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
+  );
+}
+
+function statusOf(meter, offline = false) {
+  if (offline) return 'OFFLINE';
+  if (meter.flags & 0x04) return 'ERROR';
+  if (meter.flags & 0x08) return 'UNCAL';
+  if (meter.mA < 200 || meter.flags & 0x01) return 'LOW';
+  if (meter.mA > 2000 || meter.flags & 0x02) return 'HIGH';
+  return 'NORMAL';
+}
+
+function accept(meter) {
+  if ($('mode').value === 'basic' && meter.address !== $('address').value) return;
+
+  const now = Date.now();
+  const old = meters.get(meter.address);
+  const basicMode = $('mode').value === 'basic';
+
+  meter.time = now;
+  meter.saved = old?.saved || 0;
+
+  if (basicMode || !old || now - meter.saved >= AUTO_READ_PERIOD_MS) {
+    meter.saved = now;
+    records.push({
+      time: now,
+      address: meter.address,
+      mA: meter.mA,
+      state: statusOf(meter)
+    });
+
+    if (records.length > 500) records = records.slice(-500);
+    localStorage.setItem(KEY, JSON.stringify(records));
+  }
+
+  meters.set(meter.address, meter);
+  render();
+}
+
+function createLink(device) {
+  let link = links.get(device.id);
+  if (link) return link;
+
+  link = {
+    device,
+    characteristic: null,
+    address: null,
+    rxText: '',
+    responseTimer: null
+  };
+
+  device.addEventListener('gattserverdisconnected', () => {
+    link.characteristic = null;
+    link.rxText = '';
+  });
+
+  links.set(device.id, link);
+  return link;
+}
+
+async function ensureConnected(link) {
+  if (link.device.gatt.connected && link.characteristic) {
+    return link.characteristic;
+  }
+
+  const server = link.device.gatt.connected
+    ? link.device.gatt
+    : await link.device.gatt.connect();
+
+  const service = await server.getPrimaryService(HC08_SERVICE_UUID);
+  const characteristic = await service.getCharacteristic(HC08_CHARACTERISTIC_UUID);
+
+  await characteristic.startNotifications();
+  characteristic.addEventListener(
+    'characteristicvaluechanged',
+    event => handleNotification(link, event)
+  );
+
+  link.characteristic = characteristic;
+  return characteristic;
+}
+
+function disconnectLink(link) {
+  if (link.responseTimer !== null) {
+    clearTimeout(link.responseTimer);
+    link.responseTimer = null;
+  }
+
+  if (link.device.gatt.connected) link.device.gatt.disconnect();
+  link.characteristic = null;
+}
+
+function handleNotification(link, event) {
+  link.rxText += bytesText(event.target.value);
+
+  while (true) {
+    const match = link.rxText.match(/M1[0-9A-F][0-9]{4}[0-9A-F]{3}[0-9A-F]{2}/i);
+    if (!match) break;
+
+    const meter = parse(match[0]);
+    link.rxText = link.rxText.slice(match.index + match[0].length);
+
+    if (meter) {
+      link.address = meter.address;
+      accept(meter);
+
+      if (link.responseTimer !== null) {
+        clearTimeout(link.responseTimer);
+        link.responseTimer = null;
+      }
+
+      setTimeout(() => disconnectLink(link), 100);
+    }
+  }
+
+  if (link.rxText.length > 64) link.rxText = link.rxText.slice(-64);
+}
+
+async function addMeter() {
+  if (!navigator.bluetooth) throw new Error('此浏览器不支持 Web Bluetooth');
+
+  const device = await navigator.bluetooth.requestDevice({
+    filters: [{ namePrefix: 'HC-08' }],
+    optionalServices: [HC08_SERVICE_UUID]
+  });
+
+  createLink(device);
+  $('state').textContent = '已授权';
+  $('state').className = 'ok';
+  $('detail').textContent = '已添加 ' + links.size + ' 个电流表，可开始读取';
+}
+
+async function restoreAuthorizedMeters() {
+  if (!navigator.bluetooth?.getDevices) return;
+
+  const devices = await navigator.bluetooth.getDevices();
+  for (const device of devices) {
+    if ((device.name || '').toUpperCase().includes('HC-08')) createLink(device);
+  }
+
+  if (links.size > 0) {
+    $('state').textContent = '已授权';
+    $('state').className = 'ok';
+    $('detail').textContent = '已恢复 ' + links.size + ' 个电流表授权';
+  }
+}
+
+async function requestReading(link) {
+  const characteristic = await ensureConnected(link);
+  const command = Uint8Array.of(0x52);
+
+  if (characteristic.properties.writeWithoutResponse &&
+      typeof characteristic.writeValueWithoutResponse === 'function') {
+    await characteristic.writeValueWithoutResponse(command);
+  } else if (typeof characteristic.writeValueWithResponse === 'function') {
+    await characteristic.writeValueWithResponse(command);
+  } else {
+    await characteristic.writeValue(command);
+  }
+
+  if (link.responseTimer !== null) clearTimeout(link.responseTimer);
+  link.responseTimer = setTimeout(() => {
+    disconnectLink(link);
+    $('state').textContent = '响应超时';
+    $('state').className = 'error';
+    $('detail').textContent = 'HC-08 在 5 秒内没有返回有效数据帧';
+  }, RESPONSE_TIMEOUT_MS);
+}
+
+async function pollMeters() {
+  if (links.size === 0) throw new Error('请先添加至少一个 HC-08 电流表');
+
+  const selectedAddress = $('address').value;
+  let targets = [...links.values()];
+
+  if ($('mode').value === 'basic') {
+    const knownTargets = targets.filter(
+      link => link.address === null || link.address === selectedAddress
+    );
+    if (knownTargets.length > 0) targets = knownTargets;
+  }
+
+  const results = await Promise.allSettled(targets.map(requestReading));
+  const successes = results.filter(result => result.status === 'fulfilled').length;
+
+  if (successes === 0) {
+    const failure = results.find(result => result.status === 'rejected');
+    throw failure?.reason || new Error('没有可读取的电流表');
+  }
+
+  $('detail').textContent = '已向 ' + successes + ' 个电流表发送 R 命令，等待回复';
+}
+
+function stopAutoRead() {
+  if (autoTimer !== null) {
+    clearInterval(autoTimer);
+    autoTimer = null;
+  }
+  $('scan').textContent = '启动自动读取';
+}
+
+function startAutoRead() {
+  stopAutoRead();
+  pollMeters().catch(showError);
+  autoTimer = setInterval(() => pollMeters().catch(showError), AUTO_READ_PERIOD_MS);
+  $('scan').textContent = '自动读取中';
+}
+
+function stop() {
+  stopAutoRead();
+  for (const link of links.values()) disconnectLink(link);
+  $('state').textContent = '已停止';
+  $('state').className = 'offline';
+  $('detail').textContent = '已断开蓝牙连接，设备授权仍保留';
+}
+
+function showError(error) {
+  $('state').textContent = '通信错误';
+  $('state').className = 'error';
+  $('detail').textContent = error.message;
+}
+
+function updateMode() {
+  const autoMode = $('mode').value === 'auto';
+  $('read').disabled = autoMode;
+  $('scan').disabled = !autoMode;
+
+  if (!autoMode) stopAutoRead();
+  render();
+}
+
+function render() {
+  const wanted = $('mode').value === 'basic'
+    ? meters.get($('address').value)
+    : [...meters.values()].sort((a, b) => b.time - a.time)[0];
+
+  if (wanted) {
+    const offline = $('mode').value === 'auto' &&
+      Date.now() - wanted.time > AUTO_OFFLINE_MS;
+    const state = statusOf(wanted, offline);
+
+    $('current').textContent = (wanted.mA / 1000).toFixed(3) + ' A';
+    $('state').textContent = state;
+    $('state').className = state === 'NORMAL' ? 'ok' : state.toLowerCase();
+    $('detail').textContent =
+      '地址 ' + wanted.address +
+      '  V1  序号 ' + wanted.seq +
+      '  ' + new Date(wanted.time).toLocaleTimeString();
+  } else {
+    $('current').textContent = '-- A';
+    $('state').textContent = links.size > 0 ? '等待读取' : '未连接';
+    $('state').className = 'offline';
+  }
+
+  $('rows').innerHTML = records.slice(-100).reverse().map(record =>
+    '<tr><td>' + new Date(record.time).toLocaleString() +
+    '</td><td>' + record.address +
+    '</td><td>' + (record.mA / 1000).toFixed(3) +
+    '</td><td>' + record.state + '</td></tr>'
+  ).join('');
+
+  draw();
+}
+
+function draw() {
+  const canvas = $('trend');
+  const context = canvas.getContext('2d');
+  const address = $('address').value;
+  const points = records.filter(record => record.address === address).slice(-60);
+
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.strokeStyle = '#cad8e2';
+  context.beginPath();
+
+  for (let y = 20; y < canvas.height; y += 40) {
+    context.moveTo(0, y);
+    context.lineTo(canvas.width, y);
+  }
+
+  context.stroke();
+  if (points.length < 2) return;
+
+  const max = Math.max(2100, ...points.map(point => point.mA));
+  context.strokeStyle = '#1261a0';
+  context.lineWidth = 3;
+  context.beginPath();
+
+  points.forEach((point, index) => {
+    const x = index * canvas.width / (points.length - 1);
+    const y = canvas.height - 10 - point.mA * (canvas.height - 20) / max;
+    if (index) context.lineTo(x, y);
+    else context.moveTo(x, y);
+  });
+
+  context.stroke();
+}
+
+$('add').onclick = () => addMeter().catch(showError);
+$('read').onclick = () => pollMeters().catch(showError);
+$('scan').onclick = startAutoRead;
+$('stop').onclick = stop;
+$('mode').onchange = updateMode;
+$('address').onchange = render;
+
+$('clear').onclick = () => {
+  if (confirm('清空手机中的全部记录？')) {
+    records = [];
+    localStorage.removeItem(KEY);
+    render();
+  }
+};
+
+$('csv').onclick = () => {
+  const csv = 'time,address,current_A,status\n' + records.map(record =>
+    new Date(record.time).toISOString() + ',' +
+    record.address + ',' +
+    (record.mA / 1000).toFixed(3) + ',' +
+    record.state
+  ).join('\n');
+
+  const anchor = document.createElement('a');
+  anchor.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  anchor.download = 'ammeter.csv';
+  anchor.click();
+  URL.revokeObjectURL(anchor.href);
+};
+
+setInterval(render, 1000);
+updateMode();
+restoreAuthorizedMeters().catch(() => {});
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
