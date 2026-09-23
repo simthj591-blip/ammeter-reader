@@ -2,6 +2,7 @@
 
 const $ = id => document.getElementById(id);
 const KEY = 'passive-ammeter-records-v1';
+const DEVICE_ADDRESS_KEY = 'passive-ammeter-device-addresses-v1';
 const HC08_SERVICE_UUID = 0xffe0;
 const HC08_CHARACTERISTIC_UUID = 0xffe1;
 const AUTO_READ_PERIOD_MS = 120000;
@@ -9,6 +10,7 @@ const AUTO_OFFLINE_MS = 130000;
 const RESPONSE_TIMEOUT_MS = 5000;
 
 let records = JSON.parse(localStorage.getItem(KEY) || '[]');
+let deviceAddresses = JSON.parse(localStorage.getItem(DEVICE_ADDRESS_KEY) || '{}');
 const meters = new Map();
 const links = new Map();
 let autoTimer = null;
@@ -16,6 +18,7 @@ let autoTimer = null;
 for (let i = 0; i < 16; i++) {
   const address = i.toString(16).toUpperCase();
   $('address').add(new Option(address, address));
+  $('historyAddress').add(new Option(address, address));
 }
 
 function crc8(text) {
@@ -60,7 +63,7 @@ function statusOf(meter, offline = false) {
 }
 
 function accept(meter) {
-  if ($('mode').value === 'basic' && meter.address !== $('address').value) return;
+  if ($('mode').value === 'basic' && meter.address !== $('address').value) return false;
 
   const now = Date.now();
   const old = meters.get(meter.address);
@@ -84,6 +87,7 @@ function accept(meter) {
 
   meters.set(meter.address, meter);
   render();
+  return true;
 }
 
 function createLink(device) {
@@ -93,7 +97,7 @@ function createLink(device) {
   link = {
     device,
     characteristic: null,
-    address: null,
+    address: deviceAddresses[device.id] || null,
     rxText: '',
     responseTimer: null
   };
@@ -151,7 +155,16 @@ function handleNotification(link, event) {
 
     if (meter) {
       link.address = meter.address;
-      accept(meter);
+      deviceAddresses[link.device.id] = meter.address;
+      localStorage.setItem(DEVICE_ADDRESS_KEY, JSON.stringify(deviceAddresses));
+
+      if (!accept(meter)) {
+        $('state').textContent = '已识别';
+        $('state').className = 'ok';
+        $('detail').textContent =
+          '已识别电流表地址 ' + meter.address +
+          '，当前目标地址为 ' + $('address').value;
+      }
 
       if (link.responseTimer !== null) {
         clearTimeout(link.responseTimer);
@@ -173,10 +186,11 @@ async function addMeter() {
     optionalServices: [HC08_SERVICE_UUID]
   });
 
-  createLink(device);
+  const link = createLink(device);
   $('state').textContent = '已授权';
   $('state').className = 'ok';
-  $('detail').textContent = '已添加 ' + links.size + ' 个电流表，可开始读取';
+  $('detail').textContent = '已添加设备，正在读取其4位编码开关地址';
+  await requestReading(link);
 }
 
 async function restoreAuthorizedMeters() {
@@ -223,10 +237,12 @@ async function pollMeters() {
   let targets = [...links.values()];
 
   if ($('mode').value === 'basic') {
-    const knownTargets = targets.filter(
-      link => link.address === null || link.address === selectedAddress
-    );
-    if (knownTargets.length > 0) targets = knownTargets;
+    targets = targets.filter(link => link.address === selectedAddress);
+    if (targets.length === 0) {
+      throw new Error(
+        '尚未添加地址 ' + selectedAddress + ' 的电流表，请先点击“添加电流表”完成授权和地址识别'
+      );
+    }
   }
 
   const results = await Promise.allSettled(targets.map(requestReading));
@@ -273,6 +289,7 @@ function updateMode() {
   const autoMode = $('mode').value === 'auto';
   $('read').disabled = autoMode;
   $('scan').disabled = !autoMode;
+  $('address').disabled = autoMode;
 
   if (!autoMode) stopAutoRead();
   render();
@@ -314,7 +331,7 @@ function render() {
 function draw() {
   const canvas = $('trend');
   const context = canvas.getContext('2d');
-  const address = $('address').value;
+  const address = $('historyAddress').value;
   const points = records.filter(record => record.address === address).slice(-60);
 
   context.clearRect(0, 0, canvas.width, canvas.height);
@@ -349,7 +366,11 @@ $('read').onclick = () => pollMeters().catch(showError);
 $('scan').onclick = startAutoRead;
 $('stop').onclick = stop;
 $('mode').onchange = updateMode;
-$('address').onchange = render;
+$('address').onchange = () => {
+  $('historyAddress').value = $('address').value;
+  render();
+};
+$('historyAddress').onchange = draw;
 
 $('clear').onclick = () => {
   if (confirm('清空手机中的全部记录？')) {
