@@ -8,6 +8,8 @@ const HC08_CHARACTERISTIC_UUID = 0xffe1;
 const AUTO_READ_PERIOD_MS = 120000;
 const AUTO_OFFLINE_MS = 130000;
 const RESPONSE_TIMEOUT_MS = 5000;
+// V2: M + version + address + 5 decimal digits (0.1 mA) + flags + seq + CRC.
+const METER_FRAME_PATTERN = /M2[0-9A-F][0-9]{5}[0-9A-F]{3}[0-9A-F]{2}/i;
 
 let records = JSON.parse(localStorage.getItem(KEY) || '[]');
 let deviceAddresses = JSON.parse(localStorage.getItem(DEVICE_ADDRESS_KEY) || '{}');
@@ -33,17 +35,18 @@ function crc8(text) {
 }
 
 function parse(text) {
-  const match = text.match(/M1[0-9A-F][0-9]{4}[0-9A-F]{3}[0-9A-F]{2}/i);
+  const match = text.match(METER_FRAME_PATTERN);
   if (!match) return null;
 
   const frame = match[0].toUpperCase();
-  if (crc8(frame.slice(0, 10)) !== parseInt(frame.slice(10), 16)) return null;
+  if (crc8(frame.slice(0, 11)) !== parseInt(frame.slice(11, 13), 16)) return null;
 
   return {
     address: frame[2],
-    mA: Number(frame.slice(3, 7)),
-    flags: parseInt(frame[7], 16),
-    seq: parseInt(frame.slice(8, 10), 16)
+    // The five transmitted digits are in 0.1 mA units.
+    mA: Number(frame.slice(3, 8)) / 10,
+    flags: parseInt(frame[8], 16),
+    seq: parseInt(frame.slice(9, 11), 16)
   };
 }
 
@@ -147,7 +150,7 @@ function handleNotification(link, event) {
   link.rxText += bytesText(event.target.value);
 
   while (true) {
-    const match = link.rxText.match(/M1[0-9A-F][0-9]{4}[0-9A-F]{3}[0-9A-F]{2}/i);
+    const match = link.rxText.match(METER_FRAME_PATTERN);
     if (!match) break;
 
     const meter = parse(match[0]);
@@ -305,12 +308,12 @@ function render() {
       Date.now() - wanted.time > AUTO_OFFLINE_MS;
     const state = statusOf(wanted, offline);
 
-    $('current').textContent = (wanted.mA / 1000).toFixed(3) + ' A';
+    $('current').textContent = (wanted.mA / 1000).toFixed(4) + ' A';
     $('state').textContent = state;
     $('state').className = state === 'NORMAL' ? 'ok' : state.toLowerCase();
     $('detail').textContent =
       '地址 ' + wanted.address +
-      '  V1  序号 ' + wanted.seq +
+      '  V2  序号 ' + wanted.seq +
       '  ' + new Date(wanted.time).toLocaleTimeString();
   } else {
     $('current').textContent = '-- A';
@@ -321,7 +324,7 @@ function render() {
   $('rows').innerHTML = records.slice(-100).reverse().map(record =>
     '<tr><td>' + new Date(record.time).toLocaleString() +
     '</td><td>' + record.address +
-    '</td><td>' + (record.mA / 1000).toFixed(3) +
+    '</td><td>' + (record.mA / 1000).toFixed(4) +
     '</td><td>' + record.state + '</td></tr>'
   ).join('');
 
@@ -384,7 +387,7 @@ $('csv').onclick = () => {
   const csv = 'time,address,current_A,status\n' + records.map(record =>
     new Date(record.time).toISOString() + ',' +
     record.address + ',' +
-    (record.mA / 1000).toFixed(3) + ',' +
+    (record.mA / 1000).toFixed(4) + ',' +
     record.state
   ).join('\n');
 
